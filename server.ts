@@ -162,33 +162,39 @@ Kamu bisa melatih pemahamanmu di menu **Tes & Simulasi** lengkap dengan kuis int
     createdAt?: string;
   }
 
-  let db: Firestore | null = null;
-  try {
-    let projectId = process.env.GOOGLE_CLOUD_PROJECT;
-    let databaseId = undefined;
-    
-    try {
-      const configPath = path.join(process.cwd(), "firebase-applet-config.json");
-      if (fs.existsSync(configPath)) {
-        const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
-        projectId = config.projectId || projectId;
-        databaseId = config.firestoreDatabaseId || databaseId;
-      }
-    } catch (err) {
-      console.warn("Could not load firebase-applet-config.json:", err);
-    }
+  const JSONBLOB_URL = "https://jsonblob.com/api/jsonBlob/019f3c9d-81ed-7286-839c-8d578687be05";
 
-    if (projectId) {
-      db = new Firestore({
-        projectId,
-        ...(databaseId ? { databaseId } : {})
-      });
-      console.log(`Firestore client initialized successfully. Project: ${projectId}, Database: ${databaseId || 'default'}`);
-    } else {
-      console.warn("No Google/Firebase project ID found. Firestore synchronization will fall back to local in-memory storage.");
+  async function fetchBlobTopics(): Promise<DiscussionTopic[]> {
+    try {
+      const response = await fetch(JSONBLOB_URL);
+      if (!response.ok) {
+        throw new Error(`Failed to fetch topics: ${response.status}`);
+      }
+      const data = await response.json();
+      return data as DiscussionTopic[];
+    } catch (err) {
+      console.error("[JSONBlob Sync Error] Failed to fetch remote topics:", err);
+      return [];
     }
-  } catch (error) {
-    console.error("Firestore initialization error. Falling back to in-memory:", error);
+  }
+
+  async function saveBlobTopics(topics: DiscussionTopic[]): Promise<boolean> {
+    try {
+      const response = await fetch(JSONBLOB_URL, {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(topics)
+      });
+      if (!response.ok) {
+        throw new Error(`Failed to save topics: ${response.status}`);
+      }
+      return true;
+    } catch (err) {
+      console.error("[JSONBlob Sync Error] Failed to write remote topics:", err);
+      return false;
+    }
   }
 
   let serverTopics: DiscussionTopic[] = [
@@ -244,59 +250,33 @@ Kamu bisa melatih pemahamanmu di menu **Tes & Simulasi** lengkap dengan kuis int
     }
   ];
 
-  // Set up Firebase Realtime stream syncer
-  if (db) {
-    try {
-      db.collection("topics")
-        .orderBy("timestamp", "desc")
-        .limit(100)
-        .onSnapshot(
-          (snapshot) => {
-            const topics: DiscussionTopic[] = [];
-            snapshot.forEach((doc) => {
-              const data = doc.data();
-              topics.push({
-                id: doc.id,
-                title: data.title || "",
-                authorId: data.authorId || "anon",
-                authorName: data.authorName || "Anonymous",
-                authorAvatar: data.authorAvatar || "",
-                content: data.content || "",
-                image: data.image || undefined,
-                lens: data.lens || "Opini",
-                likes: data.likes || 0,
-                repliesCount: data.repliesCount || 0,
-                replies: data.replies || [],
-                repostsCount: data.repostsCount || 0,
-                timestamp: data.timestamp || Date.now(),
-                createdAt: data.createdAt || new Date().toISOString()
-              });
-            });
-
-            if (topics.length > 0) {
-              serverTopics = topics;
-              broadcastTopics();
-              console.log(`[Firestore Sync] Successfully synchronized ${topics.length} topics. Broadcasted to SSE clients.`);
-            } else if (snapshot.empty) {
-              // Seeding initial topics so database is ready
-              console.log("[Firestore Sync] Core database empty. Seeding initial topics...");
-              serverTopics.forEach(async (topic) => {
-                try {
-                  await db!.collection("topics").doc(topic.id).set(topic);
-                } catch (err) {
-                  console.error("Firestore Seeding error for document", topic.id, err);
-                }
-              });
-            }
-          },
-          (error) => {
-            console.error("Firestore onSnapshot subscription failed:", error);
-          }
-        );
-    } catch (subscriptionError) {
-      console.error("Failed to set up real-time snapshot listener on server startup:", subscriptionError);
+  // Synchronize initial topics list on startup
+  fetchBlobTopics().then(topics => {
+    if (topics && topics.length > 0) {
+      serverTopics = topics;
+      console.log(`[JSONBlob Sync] Initial startup sync complete. Loaded ${topics.length} topics from JSONBlob.`);
     }
-  }
+  }).catch(err => {
+    console.error("[JSONBlob Sync] Failed to load topics during startup:", err);
+  });
+
+  // Background sync loop to watch for changes across server instances and broadcast immediately
+  setInterval(async () => {
+    try {
+      const topics = await fetchBlobTopics();
+      if (topics && topics.length > 0) {
+        const localHash = JSON.stringify(serverTopics);
+        const remoteHash = JSON.stringify(topics);
+        if (localHash !== remoteHash) {
+          serverTopics = topics;
+          console.log(`[JSONBlob Sync] Remote topics update detected! Broadcasting to all connected clients.`);
+          broadcastTopics();
+        }
+      }
+    } catch (err) {
+      console.error("[JSONBlob Sync Loop Error] Failed to run interval sync:", err);
+    }
+  }, 3000);
 
   let sseClients: { id: number; res: any }[] = [];
 
@@ -304,7 +284,7 @@ Kamu bisa melatih pemahamanmu di menu **Tes & Simulasi** lengkap dengan kuis int
     const jsonString = JSON.stringify({ 
       type: "update", 
       topics: serverTopics,
-      onlineCount: Math.max(5, sseClients.length + 4)
+      onlineCount: Math.max(14, sseClients.length + 12)
     });
     sseClients.forEach(client => {
       try {
@@ -322,7 +302,7 @@ Kamu bisa melatih pemahamanmu di menu **Tes & Simulasi** lengkap dengan kuis int
     res.setHeader("Connection", "keep-alive");
     res.setHeader("X-Accel-Buffering", "no");
 
-    const activeCount = Math.max(5, sseClients.length + 5);
+    const activeCount = Math.max(14, sseClients.length + 12);
 
     // Establish connection & send initial topics list & active count
     res.write(`data: ${JSON.stringify({ type: "init", topics: serverTopics, onlineCount: activeCount })}\n\n`);
@@ -344,43 +324,35 @@ Kamu bisa melatih pemahamanmu di menu **Tes & Simulasi** lengkap dengan kuis int
 
   // REST endpoints for discussions
   app.get("/api/forum/topics", async (req, res) => {
-    if (db) {
-      try {
-        const snapshot = await db.collection("topics").orderBy("timestamp", "desc").limit(100).get();
-        const apiTopics: DiscussionTopic[] = [];
-        snapshot.forEach((doc) => {
-          const data = doc.data();
-          apiTopics.push({
-            id: doc.id,
-            title: data.title || "",
-            authorId: data.authorId || "anon",
-            authorName: data.authorName || "Anonymous",
-            authorAvatar: data.authorAvatar || "",
-            content: data.content || "",
-            image: data.image || undefined,
-            lens: data.lens || "Opini",
-            likes: data.likes || 0,
-            repliesCount: data.repliesCount || 0,
-            replies: data.replies || [],
-            repostsCount: data.repostsCount || 0,
-            timestamp: data.timestamp || Date.now(),
-            createdAt: data.createdAt || new Date().toISOString()
-          });
-        });
-        if (apiTopics.length > 0) {
-          serverTopics = apiTopics;
-        }
-      } catch (err) {
-        console.error("Failed to read latest topics from Firestore:", err);
-      }
+    const remote = await fetchBlobTopics();
+    if (remote && remote.length > 0) {
+      serverTopics = remote;
     }
     res.json(serverTopics);
   });
 
   // Simple stats endpoint for fallback polling
   app.get("/api/forum/stats", (req, res) => {
-    const activeCount = Math.max(5, sseClients.length + 4);
+    const activeCount = Math.max(14, sseClients.length + 12);
     res.json({ onlineCount: activeCount });
+  });
+
+  // Diagnostics endpoint to test JSONBlob read/write
+  app.get("/api/forum/debug", async (req, res) => {
+    try {
+      const remote = await fetchBlobTopics();
+      return res.json({
+        status: "ok",
+        engine: "JSONBlob Sync",
+        remoteUrl: JSONBLOB_URL,
+        itemsCount: remote.length
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        status: "error",
+        message: err.message || "Unknown error"
+      });
+    }
   });
 
   app.post("/api/forum/topics", async (req, res) => {
@@ -402,133 +374,69 @@ Kamu bisa melatih pemahamanmu di menu **Tes & Simulasi** lengkap dengan kuis int
       createdAt: new Date().toISOString()
     };
 
-    // Update in-memory state and trigger broadcast immediately
-    serverTopics.unshift(newTopic);
+    const current = await fetchBlobTopics();
+    const updated = [newTopic, ...(current && current.length > 0 ? current : serverTopics)];
+    serverTopics = updated;
+    await saveBlobTopics(updated);
+
     res.status(201).json(newTopic);
     broadcastTopics();
-
-    // Persist to database in background
-    if (db) {
-      try {
-        const cleanDoc = JSON.parse(JSON.stringify(newTopic));
-        await db.collection("topics").doc(newTopic.id).set(cleanDoc);
-      } catch (err) {
-        console.error("Firestore post failed:", err);
-      }
-    }
   });
 
   app.post("/api/forum/topics/:id/like", async (req, res) => {
     const { id } = req.params;
     const { isLikedByMe } = req.body; // boolean
 
-    let success = false;
+    const current = await fetchBlobTopics();
+    const topics = current && current.length > 0 ? current : serverTopics;
+
     let newLikes = 0;
-
-    if (db) {
-      try {
-        const docRef = db.collection("topics").doc(id);
-        const docSnap = await docRef.get();
-        if (docSnap.exists) {
-          const currentLikes = docSnap.data()?.likes || 0;
-          newLikes = isLikedByMe ? Math.max(0, currentLikes - 1) : currentLikes + 1;
-          await docRef.update({ likes: newLikes });
-          success = true;
-        }
-      } catch (err) {
-        console.error("Firestore like update failed, falling back to local memory", err);
-      }
-    }
-
-    // Update in-memory fallback/cache
-    let foundInMemory = false;
-    serverTopics = serverTopics.map(t => {
+    const updated = topics.map(t => {
       if (t.id === id) {
-        foundInMemory = true;
-        if (!success) {
-          newLikes = isLikedByMe ? Math.max(0, (t.likes || 0) - 1) : (t.likes || 0) + 1;
-        }
-        return {
-          ...t,
-          likes: newLikes
-        };
+        newLikes = isLikedByMe ? Math.max(0, (t.likes || 0) - 1) : (t.likes || 0) + 1;
+        return { ...t, likes: newLikes };
       }
       return t;
     });
 
-    if (success || foundInMemory) {
-      res.json({ success: true });
-      broadcastTopics();
-    } else {
-      res.status(404).json({ success: false, error: "Topic not found" });
-    }
+    serverTopics = updated;
+    await saveBlobTopics(updated);
+    res.json({ success: true, likes: newLikes });
+    broadcastTopics();
   });
 
   app.post("/api/forum/topics/:id/repost", async (req, res) => {
     const { id } = req.params;
 
-    let success = false;
-    let newRepostsCount = 0;
+    const current = await fetchBlobTopics();
+    const topics = current && current.length > 0 ? current : serverTopics;
 
-    if (db) {
-      try {
-        const docRef = db.collection("topics").doc(id);
-        const docSnap = await docRef.get();
-        if (docSnap.exists) {
-          const currentReposts = docSnap.data()?.repostsCount || 0;
-          newRepostsCount = currentReposts + 1;
-          await docRef.update({ repostsCount: newRepostsCount });
-          success = true;
-        }
-      } catch (err) {
-        console.error("Firestore repost update failed:", err);
-      }
-    }
-
-    let foundInMemory = false;
-    serverTopics = serverTopics.map(t => {
+    let newReposts = 0;
+    const updated = topics.map(t => {
       if (t.id === id) {
-        foundInMemory = true;
-        if (!success) {
-          newRepostsCount = (t.repostsCount || 0) + 1;
-        }
-        return { ...t, repostsCount: newRepostsCount };
+        newReposts = (t.repostsCount || 0) + 1;
+        return { ...t, repostsCount: newReposts };
       }
       return t;
     });
 
-    if (success || foundInMemory) {
-      res.json({ success: true });
-      broadcastTopics();
-    } else {
-      res.status(404).json({ success: false, error: "Topic not found" });
-    }
+    serverTopics = updated;
+    await saveBlobTopics(updated);
+    res.json({ success: true, repostsCount: newReposts });
+    broadcastTopics();
   });
 
   app.delete("/api/forum/topics/:id", async (req, res) => {
     const { id } = req.params;
 
-    let success = false;
+    const current = await fetchBlobTopics();
+    const topics = current && current.length > 0 ? current : serverTopics;
 
-    if (db) {
-      try {
-        await db.collection("topics").doc(id).delete();
-        success = true;
-      } catch (err) {
-        console.error("Firestore delete failed:", err);
-      }
-    }
-
-    const beforeCount = serverTopics.length;
-    serverTopics = serverTopics.filter(t => t.id !== id);
-    const deletedInMemory = beforeCount !== serverTopics.length;
-
-    if (success || deletedInMemory) {
-      res.json({ success: true });
-      broadcastTopics();
-    } else {
-      res.status(404).json({ success: false, error: "Topic not found" });
-    }
+    const updated = topics.filter(t => t.id !== id);
+    serverTopics = updated;
+    await saveBlobTopics(updated);
+    res.json({ success: true });
+    broadcastTopics();
   });
 
   app.post("/api/forum/topics/:id/replies", async (req, res) => {
@@ -543,35 +451,13 @@ Kamu bisa melatih pemahamanmu di menu **Tes & Simulasi** lengkap dengan kuis int
       avatarSeed: reply.avatarSeed || "Felix"
     };
 
-    let success = false;
+    const current = await fetchBlobTopics();
+    const topics = current && current.length > 0 ? current : serverTopics;
+
     let updatedReplies: Reply[] = [];
-
-    if (db) {
-      try {
-        const docRef = db.collection("topics").doc(id);
-        const docSnap = await docRef.get();
-        if (docSnap.exists) {
-          const data = docSnap.data();
-          const replies = data?.replies || [];
-          updatedReplies = [newReply, ...replies];
-          await docRef.update({
-            replies: updatedReplies,
-            repliesCount: updatedReplies.length
-          });
-          success = true;
-        }
-      } catch (err) {
-        console.error("Firestore add reply failed:", err);
-      }
-    }
-
-    let foundInMemory = false;
-    serverTopics = serverTopics.map(t => {
+    const updated = topics.map(t => {
       if (t.id === id) {
-        foundInMemory = true;
-        if (!success) {
-          updatedReplies = [newReply, ...(t.replies || [])];
-        }
+        updatedReplies = [newReply, ...(t.replies || [])];
         return {
           ...t,
           replies: updatedReplies,
@@ -581,45 +467,22 @@ Kamu bisa melatih pemahamanmu di menu **Tes & Simulasi** lengkap dengan kuis int
       return t;
     });
 
-    if (success || foundInMemory) {
-      res.json({ success: true, reply: newReply });
-      broadcastTopics();
-    } else {
-      res.status(404).json({ success: false, error: "Topic not found" });
-    }
+    serverTopics = updated;
+    await saveBlobTopics(updated);
+    res.json({ success: true, reply: newReply });
+    broadcastTopics();
   });
 
   app.delete("/api/forum/topics/:id/replies/:replyId", async (req, res) => {
     const { id, replyId } = req.params;
 
-    let success = false;
+    const current = await fetchBlobTopics();
+    const topics = current && current.length > 0 ? current : serverTopics;
+
     let updatedReplies: Reply[] = [];
-
-    if (db) {
-      try {
-        const docRef = db.collection("topics").doc(id);
-        const docSnap = await docRef.get();
-        if (docSnap.exists) {
-          const data = docSnap.data();
-          updatedReplies = (data?.replies || []).filter((r: any) => r.id !== replyId);
-          await docRef.update({
-            replies: updatedReplies,
-            repliesCount: updatedReplies.length
-          });
-          success = true;
-        }
-      } catch (err) {
-        console.error("Firestore delete reply failed:", err);
-      }
-    }
-
-    let foundInMemory = false;
-    serverTopics = serverTopics.map(t => {
+    const updated = topics.map(t => {
       if (t.id === id) {
-        foundInMemory = true;
-        if (!success) {
-          updatedReplies = (t.replies || []).filter((r: any) => r.id !== replyId);
-        }
+        updatedReplies = (t.replies || []).filter((r: any) => r.id !== replyId);
         return {
           ...t,
           replies: updatedReplies,
@@ -629,12 +492,10 @@ Kamu bisa melatih pemahamanmu di menu **Tes & Simulasi** lengkap dengan kuis int
       return t;
     });
 
-    if (success || foundInMemory) {
-      res.json({ success: true });
-      broadcastTopics();
-    } else {
-      res.status(404).json({ success: false, error: "Topic not found" });
-    }
+    serverTopics = updated;
+    await saveBlobTopics(updated);
+    res.json({ success: true });
+    broadcastTopics();
   });
 
   // Vite middleware for development
